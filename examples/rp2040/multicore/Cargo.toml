@@ -1,10 +1,10 @@
 [package]
-name = "lilos-example-rp2040-minimal"
-authors = ["Cliff L. Biffle <code@cliffle.com>"]
+name = "lilos-example-rp2040-multicore"
+authors = ["Robert Kovacsics <kovirobi@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "Minimal example for lilos on rp2040."
+description = "Multicore example for lilos on rp2040."
 repository = "https://github.com/cbiffle/lilos/"
 keywords = ["async", "embedded", "realtime", "os"]
 categories = ["embedded"]
@@ -23,7 +23,7 @@ rp2040-pac = {version = "0.3", features = ["rt"]}
 rp2040-boot2 = "0.2"
 
 [[bin]]
-name = "lilos-example-rp2040-minimal"
+name = "lilos-example-rp2040-multicore"
 test = false
 bench = false
 

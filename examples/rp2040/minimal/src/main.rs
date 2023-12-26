@@ -65,7 +65,7 @@ fn main() -> ! {
     lilos::time::initialize_sys_tick(&mut cp.SYST, 6_000_000);
     // Set up and run the scheduler with a single task.
     lilos::exec::run_tasks(
-        &mut [blink],  // <-- array of tasks
-        lilos::exec::ALL_TASKS,  // <-- which to start initially
+        &mut [blink],           // <-- array of tasks
+        lilos::exec::ALL_TASKS, // <-- which to start initially
     )
 }
