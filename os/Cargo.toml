@@ -20,6 +20,7 @@ mutex = []
 spsc = []
 systick = []
 handoff = ["scopeguard"]
+2core = []
 
 [dependencies]
 cfg-if = "1.0.0"

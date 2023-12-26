@@ -157,6 +157,19 @@ cfg_if::cfg_if! {
 /// atomically checks and clears this at each iteration.
 static WAKE_BITS: AtomicUsize = AtomicUsize::new(0);
 
+/// Wake bits used by a previous/concurrent invocation of run_tasks
+static WAKE_BITS_USED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "2core")]
+extern "Rust" {
+    /// Function to be provided by some other crate, e.g. the HAL crate (or a
+    /// wrapper around it). Returns the core ID, for multicore systems. Must
+    /// return an ID starting from 0 for core 0 and be less than `n` where `n`
+    /// is the value used in `create_multicore_data!(n)`.
+    #[link_name = "lilos::exec::cpu_core_id"]
+    fn cpu_core_id() -> u8;
+}
+
 /// Computes the wake bit mask for the task with the given index, which is
 /// equivalent to `1 << (index % USIZE_BITS)`.
 const fn wake_mask_for_index(index: usize) -> usize {
@@ -184,6 +197,7 @@ static VTABLE: RawWakerVTable = RawWakerVTable::new(
 /// Technically, this will wake any task `n` where `n % 32 == index % 32`.
 fn waker_for_task(index: usize) -> Waker {
     let mask = wake_mask_for_index(index);
+
     // Safety: Waker::from_raw is unsafe because bad things happen if the
     // combination of this particular pointer and the functions in the vtable
     // don't meet the Waker contract or are incompatible. In our case, our
@@ -482,6 +496,8 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
     interrupts: Interrupts,
     mut idle_hook: impl FnMut(),
 ) -> ! {
+    #[cfg(feature = "2core")]
+    let core = unsafe { cpu_core_id() };
     // Record the task futures for debugger access.
     {
         // Degrade &mut[] to *mut[]
@@ -496,21 +512,46 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
         //    be wrong.
         let futures_ptr: *mut [Pin<*mut dyn Future<Output = Infallible>>] = futures_ptr as _;
         // Stash the task future array in a known location.
+        #[cfg(not(feature = "2core"))]
         unsafe {
             TASK_FUTURES = Some(futures_ptr);
         }
+
+        #[cfg(feature = "2core")]
+        unsafe {
+            TASK_FUTURES[core as usize] = Some(futures_ptr);
+        }
     }
 
-    WAKE_BITS.store(initial_mask, Ordering::SeqCst);
+    let this_count = futures.len();
+    let prev_count = WAKE_BITS_USED.fetch_add(this_count, Ordering::SeqCst);
+    let this_mask = ((1usize << this_count) - 1).rotate_left(prev_count as u32);
+
+    WAKE_BITS.fetch_or(initial_mask & this_mask, Ordering::SeqCst);
 
     // TODO make this list static for more predictable memory usage
     #[cfg(feature = "systick")]
-    create_list!(timer_list);
+    {
+        create_list!(timer_list);
 
-    #[cfg(not(feature = "systick"))]
-    let timer_list = ();
+        #[cfg(not(feature = "2core"))]
+        let tl_ref = &TIMER_LIST;
 
-    set_timer_list(timer_list, || loop {
+        #[cfg(feature = "2core")]
+        let tl_ref = &TIMER_LIST[core as usize];
+
+        let old_list = tl_ref.swap(
+            // Safety: since we've gotten a &mut, we hold the only reference, so
+            // it's safe for us to smuggle it through a pointer and reborrow it as
+            // shared.
+            unsafe { Pin::get_unchecked_mut(timer_list) },
+            Ordering::SeqCst,
+        );
+
+        cheap_assert!(old_list.is_null());
+    }
+
+    loop {
         interrupts.scope(|| {
             #[cfg(feature = "systick")]
             {
@@ -518,13 +559,14 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
                 with_timer_list(|tl| tl.wake_less_than(TickTime::now()));
             }
 
-            // Capture and reset wake bits, then process any 1s.
+            // Capture and reset wake bits (for the current executor only),
+            // then process any 1s.
             // TODO: this loop visits every future testing for 1 bits; it would
             // almost certainly be faster to visit the futures corresponding to
             // 1 bits instead. I have avoided this for now because of the
             // increased complexity.
-            let mask = WAKE_BITS.swap(0, Ordering::SeqCst);
-            for (i, f) in futures.iter_mut().enumerate() {
+            let mask = WAKE_BITS.fetch_and(!this_mask, Ordering::SeqCst);
+            for (f, i) in futures.iter_mut().zip(prev_count..) {
                 if mask & wake_mask_for_index(i) != 0 {
                     poll_task(i, f.as_mut());
                 }
@@ -532,7 +574,7 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
 
             // If none of the futures woke each other, we're relying on an
             // interrupt to set bits -- so we can sleep waiting for it.
-            if WAKE_BITS.load(Ordering::SeqCst) == 0 {
+            if WAKE_BITS.load(Ordering::SeqCst) & this_mask == 0 {
                 idle_hook();
             }
 
@@ -541,7 +583,7 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
         // Now interrupts are enabled for a brief period before diving back in.
         // Note that we allow interrupt-wake even when some wake bits are set;
         // this prevents ISR starvation by polling tasks.
-    })
+    }
 }
 
 /// This `static` variable is only written by the OS, and never read. It exists
@@ -558,7 +600,16 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
 /// Note that the `#[used]` annotation is load-bearing here -- without it the
 /// compiler will happily throw the variable away, confusing the debugger.
 #[used]
-static mut TASK_FUTURES: Option<*mut [Pin<*mut dyn Future<Output = Infallible>>]> = None;
+#[cfg(not(feature = "2core"))]
+static mut TASK_FUTURES: Option<
+    *mut [Pin<*mut dyn Future<Output = Infallible>>],
+> = None;
+
+#[used]
+#[cfg(feature = "2core")]
+static mut TASK_FUTURES: [Option<
+    *mut [Pin<*mut dyn Future<Output = Infallible>>],
+>; 2] = [None; 2];
 
 /// Constant that can be passed to `run_tasks` and `wake_tasks_by_mask` to mean
 /// "all tasks."
@@ -897,9 +948,18 @@ pub fn wake_task_by_index(index: usize) {
 }
 
 /// Tracks the timer list currently in scope.
-#[cfg(feature = "systick")]
+#[cfg(all(feature = "systick", not(feature = "2core")))]
 static TIMER_LIST: AtomicPtr<List<TickTime>> =
     AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(all(feature = "systick", feature = "2core"))]
+static TIMER_LIST: [AtomicPtr<List<TickTime>>; 2] = {
+    // See https://github.com/rust-lang/rust-clippy/issues/7665
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: AtomicPtr<List<TickTime>> =
+        AtomicPtr::new(core::ptr::null_mut());
+    [INIT; 2]
+};
 
 /// Panics if called from an interrupt service routine (ISR). This is used to
 /// prevent OS features that are unavailable to ISRs from being used in ISRs.
@@ -910,52 +970,6 @@ fn assert_not_in_isr() {
     if psr_value & 0x1FF != 0 {
         panic!();
     }
-}
-
-/// Sets the timer list for the duration of `body`.
-///
-/// This doesn't nest, and will assert if you try.
-#[cfg(feature = "systick")]
-#[inline(always)]
-fn set_timer_list<R>(
-    list: Pin<&mut List<TickTime>>,
-    body: impl FnOnce() -> R,
-) -> R {
-    // Prevent this from being used from interrupt context.
-    assert_not_in_isr();
-
-    let old_list = TIMER_LIST.swap(
-        // Safety: since we've gotten a &mut, we hold the only reference, so
-        // it's safe for us to smuggle it through a pointer and reborrow it as
-        // shared.
-        unsafe { Pin::get_unchecked_mut(list) },
-        Ordering::Acquire,
-    );
-
-    // Detect weird reentrant uses of this function. This would indicate an
-    // internal error, or possibly an application being cheeky and calling
-    // `run_tasks` from within a task. Since this assert should only be checked
-    // on executor startup, there is no need to optimize it away in release
-    // builds.
-    cheap_assert!(old_list.is_null());
-
-    let r = body();
-
-    // Give up our scoped reference so the caller's &mut has no risk of
-    // aliasing.
-    TIMER_LIST.store(core::ptr::null_mut(), Ordering::Release);
-
-    r
-}
-
-/// No-op definition of `set_timer_list` if the OS has no actual timer list.
-#[cfg(not(feature = "systick"))]
-#[inline(always)]
-fn set_timer_list<X, R>(
-    _list: X,
-    body: impl FnOnce() -> R,
-) -> R {
-    body()
 }
 
 /// Nabs a reference to the current timer list and executes `body`.
@@ -973,7 +987,16 @@ pub(crate) fn with_timer_list<R>(body: impl FnOnce(Pin<&List<TickTime>>) -> R) -
     assert_not_in_isr();
 
     let list_ref = {
-        let tlptr = TIMER_LIST.load(Ordering::Acquire);
+        #[cfg(not(feature = "2core"))]
+        let tl_ref = &TIMER_LIST;
+
+        #[cfg(feature = "2core")]
+        let tl_ref = {
+            let core = unsafe { cpu_core_id() };
+            &TIMER_LIST[core as usize]
+        };
+
+        let tlptr = tl_ref.load(Ordering::Acquire);
         // If this assertion fails, it's a sign that one of the timer-aware OS
         // primitives (likely a `sleep_*`) has been used without the OS actually
         // running.
