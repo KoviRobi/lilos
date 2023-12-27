@@ -73,11 +73,11 @@
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use pin_project_lite::pin_project;
 
-use crate::atomic::AtomicArithExt;
+use portable_atomic::{AtomicUsize, Ordering};
+
 use crate::exec::noop_waker;
 use crate::list::List;
 
@@ -149,10 +149,8 @@ impl<T> Mutex<T> {
     ///
     /// This is the cheaper, non-blocking version of [`Mutex::lock`].
     pub fn try_lock(self: Pin<&Self>) -> Option<ActionPermit<'_, T>> {
-        if self.state.fetch_or_polyfill(1, Ordering::Acquire) == 0 {
-            Some(ActionPermit {
-                mutex: self,
-            })
+        if self.state.fetch_or(1, Ordering::Acquire) == 0 {
+            Some(ActionPermit { mutex: self })
         } else {
             None
         }
@@ -303,8 +301,10 @@ impl<T> Mutex<CancelSafe<T>> {
     /// This API can be error-prone, which is why it's only available if you've
     /// asserted your guarded data is `CancelSafe`. When possible, see if you
     /// can do the job using [`Mutex::try_lock`] instead.
-    pub fn try_lock_assuming_cancel_safe(self: Pin<&Self>) -> Option<MutexGuard<'_, T>> {
-        if self.state.fetch_or_polyfill(1, Ordering::Acquire) == 0 {
+    pub fn try_lock_assuming_cancel_safe(
+        self: Pin<&Self>,
+    ) -> Option<MutexGuard<'_, T>> {
+        if self.state.fetch_or(1, Ordering::Acquire) == 0 {
             Some(MutexGuard { mutex: self })
         } else {
             None
@@ -467,12 +467,12 @@ macro_rules! create_static_mutex {
         use core::sync::atomic::{AtomicBool, Ordering};
         use core::mem::{ManuallyDrop, MaybeUninit};
         use core::pin::Pin;
-        use $crate::atomic::AtomicExt;
+        use $crate::reexport::portable_atomic::{AtomicBool, Ordering};
 
         // Flag for detecting multiple executions.
         static INIT: AtomicBool = AtomicBool::new(false);
 
-        assert_eq!(INIT.swap_polyfill(true, Ordering::SeqCst), false);
+        assert_eq!(INIT.swap(true, Ordering::SeqCst), false);
 
         // Static mutex storage.
         static mut M: MaybeUninit<$crate::mutex::Mutex<$t>> = MaybeUninit::uninit();

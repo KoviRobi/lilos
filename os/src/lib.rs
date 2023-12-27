@@ -170,7 +170,6 @@ pub(crate) use cheap_assert;
 pub mod list;
 pub mod exec;
 pub mod util;
-pub mod atomic;
 
 #[cfg(feature = "systick")]
 pub mod time;
@@ -180,3 +179,9 @@ pub mod mutex;
 pub mod spsc;
 #[cfg(feature = "handoff")]
 pub mod handoff;
+
+// For accessing from macros
+#[doc(hidden)]
+pub mod reexport {
+    pub use portable_atomic;
+}

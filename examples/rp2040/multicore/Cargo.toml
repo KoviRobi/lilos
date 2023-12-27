@@ -19,8 +19,10 @@ cortex-m = "0.7.4"
 cortex-m-rt = "0.7.1"
 lilos = { path = "../../../os", default-features = false, features = ["systick"] }
 panic-halt = "0.2.0"
-rp2040-pac = {version = "0.3", features = ["rt"]}
 rp2040-boot2 = "0.2"
+rp2040-hal = { version = "0.9.1", features = ["critical-section-impl"] }
+critical-section = "1.1.2"
+portable-atomic = { version = "1.6.0", default-features = false, features = ["critical-section"] }
 
 [[bin]]
 name = "lilos-example-rp2040-multicore"

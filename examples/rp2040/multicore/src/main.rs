@@ -23,6 +23,8 @@
 // because it isn't otherwise referenced in code!
 extern crate panic_halt;
 
+use rp2040_hal as hal; // To link critical-section
+
 // For RP2040, we need to include a bootloader. The general Cargo build process
 // doesn't have great support for this, so we included it as a binary constant.
 #[link_section = ".boot_loader"]
@@ -36,7 +38,7 @@ const PERIOD: lilos::time::Millis = lilos::time::Millis(500);
 fn main() -> ! {
     // Check out peripherals from the runtime.
     let mut cp = cortex_m::Peripherals::take().unwrap();
-    let p = rp2040_pac::Peripherals::take().unwrap();
+    let p = hal::pac::Peripherals::take().unwrap();
 
     // Configure our output pin, GPIO 25. Begin by bringing IO BANK0 out of
     // reset.

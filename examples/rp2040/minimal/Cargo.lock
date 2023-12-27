@@ -88,6 +88,7 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "pin-project-lite",
+ "portable-atomic",
 ]
 
 [[package]]
@@ -98,6 +99,7 @@ dependencies = [
  "cortex-m-rt",
  "lilos",
  "panic-halt",
+ "portable-atomic",
  "rp2040-boot2",
  "rp2040-pac",
 ]
@@ -128,6 +130,12 @@ name = "pin-project-lite"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c40d25201921e5ff0c862a505c6557ea88568a4e3ace775ab55e93f2f4f9d57"
+
+[[package]]
+name = "portable-atomic"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7170ef9988bc169ba16dd36a7fa041e5c4cbeb6a35b76d4c03daded371eae7c0"
 
 [[package]]
 name = "proc-macro2"
