@@ -29,6 +29,7 @@ use fifo::AsyncFifo;
 use rp_pico as bsp;
 
 use bsp::{hal, hal::pac};
+use hal::fugit::ExtU64;
 use hal::multicore::{Multicore, Stack};
 use hal::Clock;
 
@@ -45,6 +46,20 @@ static mut CORE1_STACK: Stack<4096> = Stack::new();
 #[export_name = "lilos::exec::cpu_core_id"]
 fn cpu_core_id() -> u16 {
     hal::Sio::core() as u16
+}
+
+fn tick<const NOM: u32, const DENOM: u32>(
+) -> hal::fugit::Duration<u64, NOM, DENOM> {
+    let timer = unsafe { &*pac::TIMER::ptr() };
+    loop {
+        let e = timer.timerawh.read().bits();
+        let t = timer.timerawl.read().bits();
+        let e2 = timer.timerawh.read().bits();
+        if e == e2 {
+            break ((e as u64) << 32) | (t as u64);
+        }
+    }
+    .micros()
 }
 
 #[bsp::entry]
