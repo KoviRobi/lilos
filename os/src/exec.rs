@@ -144,7 +144,7 @@ use portable_atomic::{AtomicUsize, Ordering};
 // still have some intimate dependencies between the modules. You'll see a few
 // other cfg(feature = "systick") lines below.
 cfg_if::cfg_if! {
-    if #[cfg(feature = "systick")] {
+    if #[cfg(all(feature = "systick", not(feature = "2core")))] {
         use portable_atomic::AtomicPtr;
 
         use crate::cheap_assert;
@@ -528,17 +528,11 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
     WAKE_BITS.fetch_or(initial_mask & this_mask, Ordering::SeqCst);
 
     // TODO make this list static for more predictable memory usage
-    #[cfg(feature = "systick")]
+    #[cfg(all(feature = "systick", not(feature = "2core")))]
     {
         create_list!(timer_list);
 
-        #[cfg(not(feature = "2core"))]
-        let tl_ref = &TIMER_LIST;
-
-        #[cfg(feature = "2core")]
-        let tl_ref = &TIMER_LIST[core as usize];
-
-        let old_list = tl_ref.swap(
+        let old_list = TIMER_LIST.swap(
             // Safety: since we've gotten a &mut, we hold the only reference, so
             // it's safe for us to smuggle it through a pointer and reborrow it as
             // shared.
@@ -551,7 +545,7 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
 
     loop {
         interrupts.scope(|| {
-            #[cfg(feature = "systick")]
+            #[cfg(all(feature = "systick", not(feature = "2core")))]
             {
                 // Scan for any expired timers.
                 with_timer_list(|tl| tl.wake_less_than(TickTime::now()));
@@ -950,18 +944,9 @@ pub fn wake_task_by_index(index: usize) {
 static TIMER_LIST: AtomicPtr<List<TickTime>> =
     AtomicPtr::new(core::ptr::null_mut());
 
-#[cfg(all(feature = "systick", feature = "2core"))]
-static TIMER_LIST: [AtomicPtr<List<TickTime>>; 2] = {
-    // See https://github.com/rust-lang/rust-clippy/issues/7665
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INIT: AtomicPtr<List<TickTime>> =
-        AtomicPtr::new(core::ptr::null_mut());
-    [INIT; 2]
-};
-
 /// Panics if called from an interrupt service routine (ISR). This is used to
 /// prevent OS features that are unavailable to ISRs from being used in ISRs.
-#[cfg(feature = "systick")]
+#[cfg(all(feature = "systick", not(feature = "2core")))]
 fn assert_not_in_isr() {
     let psr_value = cortex_m::register::apsr::read().bits();
     // Bottom 9 bits are the exception number, which are 0 in Thread mode.
@@ -979,22 +964,15 @@ fn assert_not_in_isr() {
 /// - Must not be called from an interrupt.
 /// - Must only be called with a timer list available, which is to say, from
 ///   within a task.
-#[cfg(feature = "systick")]
-pub(crate) fn with_timer_list<R>(body: impl FnOnce(Pin<&List<TickTime>>) -> R) -> R {
+#[cfg(all(feature = "systick", not(feature = "2core")))]
+pub(crate) fn with_timer_list<R>(
+    body: impl FnOnce(Pin<&List<TickTime>>) -> R,
+) -> R {
     // Prevent this from being used from interrupt context.
     assert_not_in_isr();
 
     let list_ref = {
-        #[cfg(not(feature = "2core"))]
-        let tl_ref = &TIMER_LIST;
-
-        #[cfg(feature = "2core")]
-        let tl_ref = {
-            let core = unsafe { cpu_core_id() };
-            &TIMER_LIST[core as usize]
-        };
-
-        let tlptr = tl_ref.load(Ordering::Acquire);
+        let tlptr = TIMER_LIST.load(Ordering::Acquire);
         // If this assertion fails, it's a sign that one of the timer-aware OS
         // primitives (likely a `sleep_*`) has been used without the OS actually
         // running.

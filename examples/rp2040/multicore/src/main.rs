@@ -37,6 +37,7 @@ use core::pin::{pin, Pin};
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::exception;
 use lilos::list::List;
+use lilos::time::TickTime;
 
 use embedded_hal::digital::v2::ToggleableOutputPin;
 
@@ -48,7 +49,6 @@ static BOOT: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 
-#[export_name = "lilos::exec::cpu_core_id"]
 fn cpu_core_id() -> u16 {
     hal::Sio::core() as u16
 }
@@ -67,6 +67,7 @@ fn tick<const NOM: u32, const DENOM: u32>(
     .micros()
 }
 
+#[export_name = "lilos::time::now"]
 fn now() -> u64 {
     tick::<1, 1_000>().to_millis()
 }
@@ -88,7 +89,7 @@ fn SysTick() {
 
 fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
     core: &'a mut cortex_m::Peripherals,
-    timer_list: Pin<&'a List<u64>>,
+    timer_list: Pin<&'a List<TickTime>>,
     sys_clk: hal::fugit::Rate<u32, NOM, DENOM>,
 ) -> impl FnMut() + 'a {
     // Make it so that `wfe` waits for masked interrupts as well as events --
@@ -108,38 +109,37 @@ fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
     core.SYST.set_clock_source(SystClkSource::Core);
 
     move || {
-        if let Some(wakeup_at_ms) = timer_list.peek() {
-            let wakeup_in_ms =
-                u64::min(max_sleep_ms as u64, wakeup_at_ms - now());
-            if wakeup_in_ms > 0 {
-                let wakeup_in_ticks =
-                    wakeup_in_ms as u32 * cycles_per_millisecond;
-                // Setting zero to the reload register disables systick
-                core.SYST.set_reload(wakeup_in_ticks);
-                core.SYST.clear_current();
-                core.SYST.enable_interrupt();
-                core.SYST.enable_counter();
+        match timer_list.peek() {
+            Some(wake_at_ms) => {
+                let wake_at_ms_u64 = wake_at_ms
+                    .millis_since(TickTime::from_millis_since_boot(0))
+                    .0;
+                let now_ms = now();
+                if wake_at_ms_u64 > now_ms {
+                    let wake_in_ms =
+                        u64::min(max_sleep_ms as u64, wake_at_ms_u64 - now_ms);
+                    let wake_in_ticks =
+                        wake_in_ms as u32 * cycles_per_millisecond;
+                    // Setting zero to the reload register disables systick
+                    core.SYST.set_reload(wake_in_ticks);
+                    core.SYST.clear_current();
+                    core.SYST.enable_interrupt();
+                    core.SYST.enable_counter();
+                    // We use `SEV` to signal from the other core that we can
+                    // send more data. See also the comment above on SEVONPEND
+                    cortex_m::asm::wfe();
+                } else {
+                    // We just missed a timer, don't idle
+                }
+            }
+            None => {
+                // We use `SEV` to signal from the other core that we can send
+                // more data. See also the comment above on SEVONPEND
+                cortex_m::asm::wfe();
             }
         }
-        // We use `SEV` to signal from the other core that we can send more
-        // data. See also the comment above on SEVONPEND
-        cortex_m::asm::wfe();
-        timer_list.wake_less_than(now());
+        timer_list.wake_less_than(TickTime::from_millis_since_boot(now()));
     }
-}
-
-pub async fn sleep_until(timer_list: Pin<&List<u64>>, deadline: u64) {
-    // TODO: this early return means we can't simply return the insert_and_wait
-    // future below, which is costing us some bytes of text.
-    if now() >= deadline {
-        return;
-    }
-
-    lilos::create_node!(node, deadline, lilos::exec::noop_waker());
-
-    // Insert our node into the pending timer list. If we get cancelled, the
-    // node will detach itself as it's being dropped.
-    timer_list.insert_and_wait(node.as_mut()).await;
 }
 
 #[bsp::entry]
@@ -208,7 +208,11 @@ fn main() -> ! {
             // peripherals `p` from the enclosing stack frame.
             loop {
                 let delay = sio.fifo.read_async().await;
-                sleep_until(timer_list, now() + delay as u64).await;
+                lilos::time::sleep_for(
+                    timer_list,
+                    lilos::time::Millis(delay as u64),
+                )
+                .await;
                 led.toggle().unwrap();
             }
         });

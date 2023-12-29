@@ -77,6 +77,9 @@
 //! Currently there's no example of how to do this in the repo. If you need
 //! this, please file an issue.
 
+#[cfg(feature = "2core")]
+use crate::list::List;
+
 use core::future::Future;
 use core::ops::{Add, AddAssign};
 use core::pin::Pin;
@@ -84,6 +87,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use cortex_m::peripheral::{syst::SystClkSource, SYST};
+#[cfg(not(feature = "2core"))]
 use cortex_m_rt::exception;
 use pin_project_lite::pin_project;
 
@@ -116,6 +120,7 @@ pub struct TickTime(u64);
 
 impl TickTime {
     /// Retrieves the current value of the tick counter.
+    #[cfg(not(feature = "2core"))]
     pub fn now() -> Self {
         // This loop will only repeat if e != e2, which means we raced the
         // systick ISR. Since that ISR only occurs once per millisecond, this
@@ -128,6 +133,15 @@ impl TickTime {
                 break TickTime(((e as u64) << 32) | (t as u64));
             }
         }
+    }
+
+    #[cfg(feature = "2core")]
+    pub fn now() -> Self {
+        extern "C" {
+            #[link_name = "lilos::time::now"]
+            fn now() -> u64;
+        }
+        Self(unsafe { now() })
     }
 
     /// Constructs a `TickTime` value describing a certain number of
@@ -276,7 +290,10 @@ impl From<u64> for Millis {
 /// **Cancel safety:** Strict.
 ///
 /// Dropping this future does nothing in particular.
-pub async fn sleep_until(deadline: TickTime) {
+pub async fn sleep_until(
+    #[cfg(feature = "2core")] timer_list: Pin<&List<TickTime>>,
+    deadline: TickTime,
+) {
     // TODO: this early return means we can't simply return the insert_and_wait
     // future below, which is costing us some bytes of text.
     if TickTime::now() >= deadline {
@@ -287,7 +304,13 @@ pub async fn sleep_until(deadline: TickTime) {
 
     // Insert our node into the pending timer list. If we get cancelled, the
     // node will detach itself as it's being dropped.
-    crate::exec::with_timer_list(|tl| tl.insert_and_wait(node.as_mut())).await
+    cfg_if::cfg_if! {
+        if #[cfg(not(feature = "2core"))] {
+            crate::exec::with_timer_list(|tl| tl.insert_and_wait(node.as_mut())).await
+        } else {
+            timer_list.insert_and_wait(node.as_mut()).await
+        }
+    }
 }
 
 /// Sleeps until the system time has increased by `d`.
@@ -309,10 +332,18 @@ pub async fn sleep_until(deadline: TickTime) {
 /// **Cancel safety:** Strict.
 ///
 /// Dropping this future does nothing in particular.
-pub fn sleep_for<D>(d: D) -> impl Future<Output = ()>
-    where TickTime: Add<D, Output = TickTime>,
+pub fn sleep_for<'a, D>(
+    #[cfg(feature = "2core")] timer_list: Pin<&'a List<TickTime>>,
+    d: D,
+) -> impl Future<Output = ()> + 'a
+where
+    TickTime: Add<D, Output = TickTime>,
 {
-    sleep_until(TickTime::now() + d)
+    sleep_until(
+        #[cfg(feature = "2core")]
+        timer_list,
+        TickTime::now() + d,
+    )
 }
 
 /// Alters a future to impose a deadline on its completion.
@@ -334,11 +365,20 @@ pub fn sleep_for<D>(d: D) -> impl Future<Output = ()>
 /// In this case, `await` drops the future as soon as it resolves (as always),
 /// which means the nested `some_operation()` future will be promptly dropped
 /// when we notice that the deadline has been met or exceeded.
-pub fn with_deadline<F>(deadline: TickTime, code: F) -> impl Future<Output = Option<F::Output>>
-    where F: Future,
+pub fn with_deadline<'a, F>(
+    #[cfg(feature = "2core")] timer_list: Pin<&'a List<TickTime>>,
+    deadline: TickTime,
+    code: F,
+) -> impl Future<Output = Option<F::Output>> + 'a
+where
+    F: Future + 'a,
 {
     TimeLimited {
-        limiter: sleep_until(deadline),
+        limiter: sleep_until(
+            #[cfg(feature = "2core")]
+            timer_list,
+            deadline,
+        ),
         process: code,
     }
 }
@@ -351,11 +391,21 @@ pub fn with_deadline<F>(deadline: TickTime, code: F) -> impl Future<Output = Opt
 /// as the deadline for the returned future.
 ///
 /// See [`with_deadline`] for more details.
-pub fn with_timeout<D, F>(timeout: D, code: F) -> impl Future<Output = Option<F::Output>>
-    where F: Future,
-          TickTime: Add<D, Output = TickTime>,
+pub fn with_timeout<'a, D, F>(
+    #[cfg(feature = "2core")] timer_list: Pin<&'a List<TickTime>>,
+    timeout: D,
+    code: F,
+) -> impl Future<Output = Option<F::Output>> + 'a
+where
+    F: Future + 'a,
+    TickTime: Add<D, Output = TickTime>,
 {
-    with_deadline(TickTime::now() + timeout, code)
+    with_deadline(
+        #[cfg(feature = "2core")]
+        timer_list,
+        TickTime::now() + timeout,
+        code,
+    )
 }
 
 pin_project! {
@@ -469,8 +519,16 @@ impl PeriodicGate {
     /// **Cancel safety:** Strict.
     ///
     /// Dropping this future does nothing in particular.
-    pub async fn next_time(&mut self) {
-        sleep_until(self.next).await;
+    pub async fn next_time(
+        &mut self,
+        #[cfg(feature = "2core")] timer_list: Pin<&List<TickTime>>,
+    ) {
+        sleep_until(
+            #[cfg(feature = "2core")]
+            timer_list,
+            self.next,
+        )
+        .await;
         self.next += self.interval;
     }
 }
@@ -479,6 +537,7 @@ impl PeriodicGate {
 /// code in `exec` for that.
 #[doc(hidden)]
 #[exception]
+#[cfg(all(feature = "systick", not(feature = "2core")))]
 fn SysTick() {
     if TICK.fetch_add(1, Ordering::Release) == core::u32::MAX {
         EPOCH.fetch_add(1, Ordering::Release);
