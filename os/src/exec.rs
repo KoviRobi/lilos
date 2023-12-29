@@ -160,16 +160,6 @@ static WAKE_BITS: AtomicUsize = AtomicUsize::new(0);
 /// Wake bits used by a previous/concurrent invocation of run_tasks
 static WAKE_BITS_USED: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(feature = "2core")]
-extern "Rust" {
-    /// Function to be provided by some other crate, e.g. the HAL crate (or a
-    /// wrapper around it). Returns the core ID, for multicore systems. Must
-    /// return an ID starting from 0 for core 0 and be less than `n` where `n`
-    /// is the value used in `create_multicore_data!(n)`.
-    #[link_name = "lilos::exec::cpu_core_id"]
-    fn cpu_core_id() -> u8;
-}
-
 /// Computes the wake bit mask for the task with the given index, which is
 /// equivalent to `1 << (index % USIZE_BITS)`.
 const fn wake_mask_for_index(index: usize) -> usize {
@@ -381,12 +371,15 @@ impl Interrupts {
 pub fn run_tasks(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "2core")] core: u8,
 ) -> ! {
     // Safety: we're passing Interrupts::Masked, the always-safe option
     unsafe {
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "2core")]
+            core,
             Interrupts::Masked,
             || {
                 cortex_m::asm::wfi();
@@ -418,6 +411,7 @@ pub fn run_tasks(
 pub fn run_tasks_with_idle(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "2core")] core: u8,
     idle_hook: impl FnMut(),
 ) -> ! {
     // Safety: we're passing Interrupts::Masked, the always-safe option
@@ -425,6 +419,8 @@ pub fn run_tasks_with_idle(
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "2core")]
+            core,
             Interrupts::Masked,
             idle_hook,
         )
@@ -454,6 +450,7 @@ pub fn run_tasks_with_idle(
 pub unsafe fn run_tasks_with_preemption(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "2core")] core: u8,
     interrupts: Interrupts,
 ) -> ! {
     // Safety: this is safe if our own contract is upheld.
@@ -461,6 +458,8 @@ pub unsafe fn run_tasks_with_preemption(
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "2core")]
+            core,
             interrupts,
             cortex_m::asm::wfi,
         )
@@ -493,11 +492,10 @@ pub unsafe fn run_tasks_with_preemption(
 pub unsafe fn run_tasks_with_preemption_and_idle(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "2core")] core: u8,
     interrupts: Interrupts,
     mut idle_hook: impl FnMut(),
 ) -> ! {
-    #[cfg(feature = "2core")]
-    let core = unsafe { cpu_core_id() };
     // Record the task futures for debugger access.
     {
         // Degrade &mut[] to *mut[]

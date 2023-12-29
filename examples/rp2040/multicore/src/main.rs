@@ -33,6 +33,11 @@ use hal::fugit::ExtU64;
 use hal::multicore::{Multicore, Stack};
 use hal::Clock;
 
+use core::pin::{pin, Pin};
+use cortex_m::peripheral::syst::SystClkSource;
+use cortex_m_rt::exception;
+use lilos::list::List;
+
 use embedded_hal::digital::v2::ToggleableOutputPin;
 
 // For RP2040, we need to include a bootloader. The general Cargo build process
@@ -62,10 +67,85 @@ fn tick<const NOM: u32, const DENOM: u32>(
     .micros()
 }
 
+fn now() -> u64 {
+    tick::<1, 1_000>().to_millis()
+}
+
+/// We mostly just need to not enter an infinite loop, which is what the
+/// `cortex_m_rt` does in `DefaultHandler`. But turning systick off until it's
+/// needed can save some energy, especially if the reload value is small.
+#[exception]
+fn SysTick() {
+    // Disable the counter, we enable it again when necessary
+    // Safety: We are in the SysTick interrupt handler, having been woken up by
+    // it, so shouldn't receive another systick interrupt here.
+    unsafe {
+        let syst = &*cortex_m::peripheral::SYST::PTR;
+        const SYST_CSR_TICKINT: u32 = 1 << 1;
+        syst.csr.modify(|v| v & !SYST_CSR_TICKINT);
+    }
+}
+
+fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
+    core: &'a mut cortex_m::Peripherals,
+    timer_list: Pin<&'a List<u64>>,
+    sys_clk: hal::fugit::Rate<u32, NOM, DENOM>,
+) -> impl FnMut() + 'a {
+    // Make it so that `wfe` waits for masked interrupts as well as events --
+    // the problem is that the idle-task is called with interrupts disabled (to
+    // not have an interrupt fire before we call the idle task but after we
+    // check that we should sleep -- for `wfi` it would just wake up).
+    // See
+    // https://www.embedded.com/the-definitive-guide-to-arm-cortex-m0-m0-wake-up-operation/
+    const SEVONPEND: u32 = 1 << 4;
+    unsafe {
+        core.SCB.scr.modify(|scr| scr | SEVONPEND);
+    }
+
+    let cycles_per_millisecond = sys_clk.to_kHz();
+    // 24-bit timer
+    let max_sleep_ms = ((1 << 24) - 1) / cycles_per_millisecond;
+    core.SYST.set_clock_source(SystClkSource::Core);
+
+    move || {
+        if let Some(wakeup_at_ms) = timer_list.peek() {
+            let wakeup_in_ms =
+                u64::min(max_sleep_ms as u64, wakeup_at_ms - now());
+            if wakeup_in_ms > 0 {
+                let wakeup_in_ticks =
+                    wakeup_in_ms as u32 * cycles_per_millisecond;
+                // Setting zero to the reload register disables systick
+                core.SYST.set_reload(wakeup_in_ticks);
+                core.SYST.clear_current();
+                core.SYST.enable_interrupt();
+                core.SYST.enable_counter();
+            }
+        }
+        // We use `SEV` to signal from the other core that we can send more
+        // data. See also the comment above on SEVONPEND
+        cortex_m::asm::wfe();
+        timer_list.wake_less_than(now());
+    }
+}
+
+pub async fn sleep_until(timer_list: Pin<&List<u64>>, deadline: u64) {
+    // TODO: this early return means we can't simply return the insert_and_wait
+    // future below, which is costing us some bytes of text.
+    if now() >= deadline {
+        return;
+    }
+
+    lilos::create_node!(node, deadline, lilos::exec::noop_waker());
+
+    // Insert our node into the pending timer list. If we get cancelled, the
+    // node will detach itself as it's being dropped.
+    timer_list.insert_and_wait(node.as_mut()).await;
+}
+
 #[bsp::entry]
 fn main() -> ! {
     // Check out peripherals from the runtime.
-    let mut core = pac::CorePeripherals::take().unwrap();
+    let core = pac::CorePeripherals::take().unwrap();
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
     let clocks = hal::clocks::init_clocks_and_plls(
@@ -114,30 +194,21 @@ fn main() -> ! {
         let pac = unsafe { pac::Peripherals::steal() };
         let mut sio = hal::Sio::new(pac.SIO);
 
-        // Make it so that `wfe` waits for masked interrupts as well as events --
-        // the problem is that the idle-task is called with interrupts disabled (to
-        // not have an interrupt fire before we call the idle task but after we
-        // check that we should sleep -- for `wfi` it would just wake up).
-        // See
-        // https://www.embedded.com/the-definitive-guide-to-arm-cortex-m0-m0-wake-up-operation/
-        const SEVONPEND: u32 = 1 << 4;
-        unsafe {
-            core.SCB.scr.modify(|scr| scr | SEVONPEND);
-        }
+        lilos::create_list!(timer_list);
+        let timer_list = timer_list.as_ref();
 
-        // And so we need to initialize sys-tick on core 1 too
-        lilos::time::initialize_sys_tick(&mut core.SYST, sys_clk.to_Hz());
+        let idle_task = make_idle_task(&mut core, timer_list, sys_clk);
 
         fifo::reset_read_fifo(&mut sio.fifo);
 
         // Create a task to blink the LED. You could also write this as an `async
         // fn` but we've inlined it as an `async` block for simplicity.
-        let blink = core::pin::pin!(async {
+        let blink = pin!(async {
             // Loop forever, blinking things. Note that this borrows the device
             // peripherals `p` from the enclosing stack frame.
             loop {
                 let delay = sio.fifo.read_async().await;
-                lilos::time::sleep_for(lilos::time::Millis(delay as u64)).await;
+                sleep_until(timer_list, now() + delay as u64).await;
                 led.toggle().unwrap();
             }
         });
@@ -145,15 +216,12 @@ fn main() -> ! {
         lilos::exec::run_tasks_with_idle(
             &mut [blink],           // <-- array of tasks
             lilos::exec::ALL_TASKS, // <-- which to start initially
-            // We use `SEV` to signal from the other core that we can send more
-            // data. See also the comment above on SEVONPEND
-            cortex_m::asm::wfe,
+            1,
+            idle_task,
         )
     });
 
-    lilos::time::initialize_sys_tick(&mut core.SYST, sys_clk.to_Hz());
-
-    let compute_delay = core::pin::pin!(async {
+    let compute_delay = pin!(async {
         /// How much we adjust the LED period every cycle
         const INC: i32 = 2;
         /// The minimum LED toggle interval we allow for.
@@ -174,6 +242,7 @@ fn main() -> ! {
     lilos::exec::run_tasks_with_idle(
         &mut [compute_delay],   // <-- array of tasks
         lilos::exec::ALL_TASKS, // <-- which to start initially
+        0,
         // We use `SEV` to signal from the other core that we can send more
         // data. See also the comment above on SEVONPEND
         cortex_m::asm::wfe,
