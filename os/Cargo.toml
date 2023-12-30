@@ -15,9 +15,10 @@ all-features = true
 default-target = "thumbv7em-none-eabihf"
 
 [features]
-default = ["mutex", "spsc", "systick"]
+default = ["mutex", "spsc", "timer", "systick"]
 mutex = []
 spsc = []
+timer = []
 systick = []
 handoff = ["scopeguard"]
 2core = []

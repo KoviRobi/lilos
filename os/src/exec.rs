@@ -130,6 +130,9 @@
 //! convert your use of `run_tasks` to the more complex form, start by copying
 //! the code from `run_tasks`.
 
+#[cfg(feature = "timer")]
+use crate::time::Timer;
+
 use core::convert::Infallible;
 use core::future::Future;
 use core::mem;
@@ -139,19 +142,6 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use pin_project_lite::pin_project;
 
 use portable_atomic::{AtomicUsize, Ordering};
-
-// Despite the untangling of exec and time that happened in the 1.0 release, we
-// still have some intimate dependencies between the modules. You'll see a few
-// other cfg(feature = "systick") lines below.
-cfg_if::cfg_if! {
-    if #[cfg(all(feature = "systick", not(feature = "2core")))] {
-        use portable_atomic::AtomicPtr;
-
-        use crate::cheap_assert;
-        use crate::list::List;
-        use crate::time::TickTime;
-    }
-}
 
 /// Accumulates bitmasks from wakers as they are invoked. The executor
 /// atomically checks and clears this at each iteration.
@@ -368,9 +358,10 @@ impl Interrupts {
 /// until an interrupt arrives. This has the advantages of using less power and
 /// having more predictable response latency than spinning. If you'd like to
 /// override this behavior, see [`run_tasks_with_idle`].
-pub fn run_tasks(
+pub fn run_tasks<#[cfg(feature = "timer")] T: Timer>(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "timer")] timer: &T,
     #[cfg(feature = "2core")] core: u8,
 ) -> ! {
     // Safety: we're passing Interrupts::Masked, the always-safe option
@@ -378,6 +369,8 @@ pub fn run_tasks(
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "timer")]
+            timer,
             #[cfg(feature = "2core")]
             core,
             Interrupts::Masked,
@@ -408,9 +401,10 @@ pub fn run_tasks(
 /// WFI yourself from within the implementation of `idle_hook`.
 ///
 /// See [`run_tasks`] for more details.
-pub fn run_tasks_with_idle(
+pub fn run_tasks_with_idle<#[cfg(feature = "timer")] T: Timer>(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "timer")] timer: &T,
     #[cfg(feature = "2core")] core: u8,
     idle_hook: impl FnMut(),
 ) -> ! {
@@ -419,6 +413,8 @@ pub fn run_tasks_with_idle(
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "timer")]
+            timer,
             #[cfg(feature = "2core")]
             core,
             Interrupts::Masked,
@@ -447,9 +443,10 @@ pub fn run_tasks_with_idle(
 /// Note that none of the top-level functions in this module are safe to use
 /// from a custom ISR. Only operations on types that are specifically described
 /// as being ISR safe, such as `Notify::notify`, can be used from ISRs.
-pub unsafe fn run_tasks_with_preemption(
+pub unsafe fn run_tasks_with_preemption<#[cfg(feature = "timer")] T: Timer>(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "timer")] timer: &T,
     #[cfg(feature = "2core")] core: u8,
     interrupts: Interrupts,
 ) -> ! {
@@ -458,6 +455,8 @@ pub unsafe fn run_tasks_with_preemption(
         run_tasks_with_preemption_and_idle(
             futures,
             initial_mask,
+            #[cfg(feature = "timer")]
+            timer,
             #[cfg(feature = "2core")]
             core,
             interrupts,
@@ -489,9 +488,12 @@ pub unsafe fn run_tasks_with_preemption(
 /// Note that none of the top-level functions in this module are safe to use
 /// from a custom ISR. Only operations on types that are specifically described
 /// as being ISR safe, such as `Notify::notify`, can be used from ISRs.
-pub unsafe fn run_tasks_with_preemption_and_idle(
+pub unsafe fn run_tasks_with_preemption_and_idle<
+    #[cfg(feature = "timer")] T: Timer,
+>(
     futures: &mut [Pin<&mut dyn Future<Output = Infallible>>],
     initial_mask: usize,
+    #[cfg(feature = "timer")] timer: &T,
     #[cfg(feature = "2core")] core: u8,
     interrupts: Interrupts,
     mut idle_hook: impl FnMut(),
@@ -528,28 +530,17 @@ pub unsafe fn run_tasks_with_preemption_and_idle(
     WAKE_BITS.fetch_or(initial_mask & this_mask, Ordering::SeqCst);
 
     // TODO make this list static for more predictable memory usage
-    #[cfg(all(feature = "systick", not(feature = "2core")))]
+    #[cfg(all(feature = "timer", feature = "systick", not(feature = "2core")))]
     {
         create_list!(timer_list);
 
-        let old_list = TIMER_LIST.swap(
-            // Safety: since we've gotten a &mut, we hold the only reference, so
-            // it's safe for us to smuggle it through a pointer and reborrow it as
-            // shared.
-            unsafe { Pin::get_unchecked_mut(timer_list) },
-            Ordering::SeqCst,
-        );
-
-        cheap_assert!(old_list.is_null());
+        crate::time::SysTickTimer.init(timer_list);
     }
 
     loop {
         interrupts.scope(|| {
-            #[cfg(all(feature = "systick", not(feature = "2core")))]
-            {
-                // Scan for any expired timers.
-                with_timer_list(|tl| tl.wake_less_than(TickTime::now()));
-            }
+            #[cfg(feature = "timer")]
+            timer.timer_list().wake_less_than(timer.now());
 
             // Capture and reset wake bits (for the current executor only),
             // then process any 1s.
@@ -937,56 +928,6 @@ pub fn wake_tasks_by_mask(mask: usize) {
 #[inline(always)]
 pub fn wake_task_by_index(index: usize) {
     wake_tasks_by_mask(wake_mask_for_index(index));
-}
-
-/// Tracks the timer list currently in scope.
-#[cfg(all(feature = "systick", not(feature = "2core")))]
-static TIMER_LIST: AtomicPtr<List<TickTime>> =
-    AtomicPtr::new(core::ptr::null_mut());
-
-/// Panics if called from an interrupt service routine (ISR). This is used to
-/// prevent OS features that are unavailable to ISRs from being used in ISRs.
-#[cfg(all(feature = "systick", not(feature = "2core")))]
-fn assert_not_in_isr() {
-    let psr_value = cortex_m::register::apsr::read().bits();
-    // Bottom 9 bits are the exception number, which are 0 in Thread mode.
-    if psr_value & 0x1FF != 0 {
-        panic!();
-    }
-}
-
-/// Nabs a reference to the current timer list and executes `body`.
-///
-/// This provides a safe way to access the timer thread local.
-///
-/// # Preconditions
-///
-/// - Must not be called from an interrupt.
-/// - Must only be called with a timer list available, which is to say, from
-///   within a task.
-#[cfg(all(feature = "systick", not(feature = "2core")))]
-pub(crate) fn with_timer_list<R>(
-    body: impl FnOnce(Pin<&List<TickTime>>) -> R,
-) -> R {
-    // Prevent this from being used from interrupt context.
-    assert_not_in_isr();
-
-    let list_ref = {
-        let tlptr = TIMER_LIST.load(Ordering::Acquire);
-        // If this assertion fails, it's a sign that one of the timer-aware OS
-        // primitives (likely a `sleep_*`) has been used without the OS actually
-        // running.
-        cheap_assert!(!tlptr.is_null());
-
-        // Safety: if it's not null, then it came from a `Pin<&mut>` that we
-        // have been loaned. We do not treat it as a &mut anywhere, so we can
-        // safely reborrow it as shared.
-        unsafe {
-            Pin::new_unchecked(&*tlptr)
-        }
-    };
-
-    body(list_ref)
 }
 
 /// Returns a future that will be pending exactly once before resolving.

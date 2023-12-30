@@ -37,9 +37,10 @@ use core::pin::{pin, Pin};
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::exception;
 use lilos::list::List;
-use lilos::time::TickTime;
 
 use embedded_hal::digital::v2::ToggleableOutputPin;
+
+type Instant = hal::fugit::Instant<u64, 1, 1_000_000>;
 
 // For RP2040, we need to include a bootloader. The general Cargo build process
 // doesn't have great support for this, so we included it as a binary constant.
@@ -53,23 +54,16 @@ fn cpu_core_id() -> u16 {
     hal::Sio::core() as u16
 }
 
-fn tick<const NOM: u32, const DENOM: u32>(
-) -> hal::fugit::Duration<u64, NOM, DENOM> {
+fn tick() -> Instant {
     let timer = unsafe { &*pac::TIMER::ptr() };
-    loop {
+    Instant::from_ticks(loop {
         let e = timer.timerawh.read().bits();
         let t = timer.timerawl.read().bits();
         let e2 = timer.timerawh.read().bits();
         if e == e2 {
             break ((e as u64) << 32) | (t as u64);
         }
-    }
-    .micros()
-}
-
-#[export_name = "lilos::time::now"]
-fn now() -> u64 {
-    tick::<1, 1_000>().to_millis()
+    })
 }
 
 /// We mostly just need to not enter an infinite loop, which is what the
@@ -87,10 +81,10 @@ fn SysTick() {
     }
 }
 
-fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
+fn make_idle_task<'a>(
     core: &'a mut cortex_m::Peripherals,
-    timer_list: Pin<&'a List<TickTime>>,
-    sys_clk: hal::fugit::Rate<u32, NOM, DENOM>,
+    timer_list: Pin<&'a List<Instant>>,
+    cycles_per_us: u32,
 ) -> impl FnMut() + 'a {
     // Make it so that `wfe` waits for masked interrupts as well as events --
     // the problem is that the idle-task is called with interrupts disabled (to
@@ -103,24 +97,22 @@ fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
         core.SCB.scr.modify(|scr| scr | SEVONPEND);
     }
 
-    let cycles_per_millisecond = sys_clk.to_kHz();
     // 24-bit timer
-    let max_sleep_ms = ((1 << 24) - 1) / cycles_per_millisecond;
+    let max_sleep_us = ((1 << 24) - 1) / cycles_per_us;
     core.SYST.set_clock_source(SystClkSource::Core);
 
     move || {
         match timer_list.peek() {
-            Some(wake_at_ms) => {
-                let wake_at_ms_u64 = wake_at_ms
-                    .millis_since(TickTime::from_millis_since_boot(0))
-                    .0;
-                let now_ms = now();
-                if wake_at_ms_u64 > now_ms {
-                    let wake_in_ms =
-                        u64::min(max_sleep_ms as u64, wake_at_ms_u64 - now_ms);
-                    let wake_in_ticks =
-                        wake_in_ms as u32 * cycles_per_millisecond;
-                    // Setting zero to the reload register disables systick
+            Some(wake_at) => {
+                let now = tick();
+                if wake_at > now {
+                    let wake_in_us = u64::min(
+                        max_sleep_us as u64,
+                        (wake_at - now).to_micros(),
+                    );
+                    let wake_in_ticks = wake_in_us as u32 * cycles_per_us;
+                    // Setting zero to the reload register disables systick --
+                    // systick is non-zero due to `wake_at > now`
                     core.SYST.set_reload(wake_in_ticks);
                     core.SYST.clear_current();
                     core.SYST.enable_interrupt();
@@ -138,7 +130,21 @@ fn make_idle_task<'a, const NOM: u32, const DENOM: u32>(
                 cortex_m::asm::wfe();
             }
         }
-        timer_list.wake_less_than(TickTime::from_millis_since_boot(now()));
+    }
+}
+
+struct Timer<'a> {
+    timer_list: Pin<&'a List<Instant>>,
+}
+
+impl<'a> lilos::time::Timer for Timer<'a> {
+    type Instant = Instant;
+    fn timer_list(&self) -> Pin<&'a List<Self::Instant>> {
+        self.timer_list
+    }
+
+    fn now(&self) -> Self::Instant {
+        tick()
     }
 }
 
@@ -194,10 +200,10 @@ fn main() -> ! {
         let pac = unsafe { pac::Peripherals::steal() };
         let mut sio = hal::Sio::new(pac.SIO);
 
-        lilos::create_list!(timer_list);
+        lilos::create_list!(timer_list, Instant::from_ticks(0));
         let timer_list = timer_list.as_ref();
-
-        let idle_task = make_idle_task(&mut core, timer_list, sys_clk);
+        let timer = Timer { timer_list };
+        let idle_task = make_idle_task(&mut core, timer_list, sys_clk.to_MHz());
 
         fifo::reset_read_fifo(&mut sio.fifo);
 
@@ -207,12 +213,8 @@ fn main() -> ! {
             // Loop forever, blinking things. Note that this borrows the device
             // peripherals `p` from the enclosing stack frame.
             loop {
-                let delay = sio.fifo.read_async().await;
-                lilos::time::sleep_for(
-                    timer_list,
-                    lilos::time::Millis(delay as u64),
-                )
-                .await;
+                let delay = sio.fifo.read_async().await as u64;
+                lilos::time::sleep_for(&timer, delay.millis()).await;
                 led.toggle().unwrap();
             }
         });
@@ -220,6 +222,7 @@ fn main() -> ! {
         lilos::exec::run_tasks_with_idle(
             &mut [blink],           // <-- array of tasks
             lilos::exec::ALL_TASKS, // <-- which to start initially
+            &timer,
             1,
             idle_task,
         )
@@ -242,10 +245,15 @@ fn main() -> ! {
         }
     });
 
+    lilos::create_list!(timer_list, Instant::from_ticks(0));
+    let timer_list = timer_list.as_ref();
+    let timer = Timer { timer_list };
+
     // Set up and run the scheduler with a single task.
     lilos::exec::run_tasks_with_idle(
         &mut [compute_delay],   // <-- array of tasks
         lilos::exec::ALL_TASKS, // <-- which to start initially
+        &timer,
         0,
         // We use `SEV` to signal from the other core that we can send more
         // data. See also the comment above on SEVONPEND
