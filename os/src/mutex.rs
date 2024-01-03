@@ -467,7 +467,6 @@ macro_rules! create_mutex {
 #[macro_export]
 macro_rules! create_static_mutex {
     ($t:ty, $contents:expr) => {{
-        use core::sync::atomic::{AtomicBool, Ordering};
         use core::mem::{ManuallyDrop, MaybeUninit};
         use core::pin::Pin;
         use $crate::reexport::portable_atomic::{AtomicBool, Ordering};
