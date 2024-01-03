@@ -105,6 +105,9 @@ pin_project! {
     }
 }
 
+unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+
 impl<T> Mutex<T> {
     /// Returns an initialized but invalid mutex.
     ///
