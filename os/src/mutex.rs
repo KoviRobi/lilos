@@ -105,6 +105,9 @@ pin_project! {
     }
 }
 
+const LOCKED: usize = 0x1;
+const LIST_OPERATION_IN_PROGRESS: usize = 0x2;
+
 unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
@@ -152,7 +155,7 @@ impl<T> Mutex<T> {
     ///
     /// This is the cheaper, non-blocking version of [`Mutex::lock`].
     pub fn try_lock(self: Pin<&Self>) -> Option<ActionPermit<'_, T>> {
-        if self.state.fetch_or(1, Ordering::Acquire) == 0 {
+        if self.state.fetch_or(LOCKED, Ordering::Acquire) == 0 {
             Some(ActionPermit { mutex: self })
         } else {
             None
@@ -175,11 +178,18 @@ impl<T> Mutex<T> {
     /// might do this if you have, for instance, used `forget` on the
     /// `MutexGuard` for some reason.
     pub unsafe fn unlock(self: Pin<&Self>) {
+        while self
+            .state
+            .fetch_or(LIST_OPERATION_IN_PROGRESS, Ordering::SeqCst)
+            & LIST_OPERATION_IN_PROGRESS
+            != 0
+        {}
         let p = self.project_ref();
         if p.waiters.wake_one() {
             // Someone was waiting. We will leave the state as taken to ensure
             // that no interloper can steal the mutex from the new rightful
             // owner before that owner is polled next.
+            self.state.store(LOCKED, Ordering::Release);
         } else {
             // Nobody was waiting. Allow whoever tries next to get the mutex.
             self.state.store(0, Ordering::Release);
@@ -216,20 +226,30 @@ impl<T> Mutex<T> {
     /// strict-cancel-safe operations using `Mutex`.
     pub async fn lock(self: Pin<&Self>) -> ActionPermit<'_, T> {
         // Complete synchronously if the mutex is uncontended.
-        // TODO this is repeated above the loop to avoid the cost of re-setting
-        // up the wait node in every loop iteration, and to avoid setting it up
-        // in the uncontended case. Is this premature optimization?
-        if let Some(perm) = self.try_lock() {
-            return perm;
+        let state = self
+            .state
+            .fetch_or(LIST_OPERATION_IN_PROGRESS | LOCKED, Ordering::Acquire);
+        if state == 0 {
+            self.state
+                .fetch_and(!LIST_OPERATION_IN_PROGRESS, Ordering::SeqCst);
+            return ActionPermit { mutex: self };
+        }
+
+        if state & LIST_OPERATION_IN_PROGRESS != 0 {
+            while self
+                .state
+                .fetch_or(LIST_OPERATION_IN_PROGRESS, Ordering::SeqCst)
+                & LIST_OPERATION_IN_PROGRESS
+                != 0
+            {}
         }
 
         // We'd like to put our name on the wait list, please.
         create_node!(wait_node, (), noop_waker());
 
         let p = self.project_ref();
-        p.waiters.insert_and_wait_with_cleanup(
-            wait_node.as_mut(),
-            || {
+        p.waiters
+            .insert_and_wait_with_cleanup(wait_node.as_mut(), || {
                 // Safety: if we are evicted from the wait list, which is
                 // the only time this cleanup routine is called, then we own
                 // the mutex and are responsible for unlocking it, though we
@@ -237,8 +257,12 @@ impl<T> Mutex<T> {
                 unsafe {
                     self.unlock();
                 }
-            },
-        ).await;
+            })
+            .await;
+
+        self.state
+            .fetch_and(!LIST_OPERATION_IN_PROGRESS, Ordering::SeqCst);
+
         // We've been booted out of the waiter list, which (by construction)
         // only happens in `unlock`. Meaning, someone just released the
         // mutex and it's our turn. However, they should _not_ have cleared
@@ -246,9 +270,7 @@ impl<T> Mutex<T> {
         // `try_lock` which expects to find the flag clear.
         debug_assert_eq!(self.state.load(Ordering::Acquire), 1);
 
-        ActionPermit {
-            mutex: self,
-        }
+        ActionPermit { mutex: self }
     }
 
     unsafe fn contents(&self) -> &T {
@@ -307,7 +329,7 @@ impl<T> Mutex<CancelSafe<T>> {
     pub fn try_lock_assuming_cancel_safe(
         self: Pin<&Self>,
     ) -> Option<MutexGuard<'_, T>> {
-        if self.state.fetch_or(1, Ordering::Acquire) == 0 {
+        if self.state.fetch_or(LOCKED, Ordering::Acquire) == 0 {
             Some(MutexGuard { mutex: self })
         } else {
             None
