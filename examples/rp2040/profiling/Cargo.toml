@@ -1,0 +1,29 @@
+[package]
+name = "profiling"
+description = "Lilos task switching profiling"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = { version = "0.7.3", optional = true }
+cortex-m-rt-macros = "0.7.0"
+panic-halt = "0.2.0"
+rp-pico = { version = "0.8.0", default-features = false, features = ["rom-func-cache", "rt"] }
+rp2040-hal = { version = "0.9.2", features = ["critical-section-impl"] }
+rp2040-pac = { version = "0.5.0", features = ["critical-section"] }
+lilos = { path = "../../../os", default-features = false, features = ["spsc"] }
+portable-atomic = { version = "1.6.0", default-features = false }
+usb-device = "0.2.9"
+usbd-serial = "0.1.1"
+embedded-hal = "0.2.7"
+defmt = { version = "0.3.6" }
+defmt-rtt = "0.4.0"
+
+[features]
+default = [ "flash" ]
+flash = [ "dep:cortex-m-rt", "rp-pico/boot2" ]
+pa-1core = [ "portable-atomic/unsafe-assume-single-core" ]
+pa-crit = [ "portable-atomic/critical-section" ]
